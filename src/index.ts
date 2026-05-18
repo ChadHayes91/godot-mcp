@@ -9,7 +9,8 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize } from 'path';
-import { existsSync, readdirSync, mkdirSync } from 'fs';
+import { existsSync, readdirSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
 
@@ -57,6 +58,95 @@ interface GodotServerConfig {
 interface OperationParams {
   [key: string]: any;
 }
+
+/**
+ * GDScript content for the viewport capture wrapper scene.
+ *
+ * Loads the target scene under a wrapper Node, lets it render for a
+ * configurable delay, then writes the viewport contents to disk as PNG
+ * and quits. The wrapper scene becomes the running scene for the duration
+ * of the capture, so the target project's main_scene is never modified.
+ */
+const CAPTURE_SCRIPT_GD: string = `extends Node
+
+func _ready() -> void:
+\tvar user_args := OS.get_cmdline_user_args()
+\tvar output_path := ""
+\tvar target_path := ""
+\tvar delay_seconds := 0.5
+\tvar i := 0
+\twhile i < user_args.size():
+\t\tmatch user_args[i]:
+\t\t\t"--output":
+\t\t\t\tif i + 1 < user_args.size():
+\t\t\t\t\toutput_path = user_args[i + 1]
+\t\t\t\t\ti += 2
+\t\t\t\telse:
+\t\t\t\t\ti += 1
+\t\t\t"--target":
+\t\t\t\tif i + 1 < user_args.size():
+\t\t\t\t\ttarget_path = user_args[i + 1]
+\t\t\t\t\ti += 2
+\t\t\t\telse:
+\t\t\t\t\ti += 1
+\t\t\t"--delay":
+\t\t\t\tif i + 1 < user_args.size():
+\t\t\t\t\tdelay_seconds = float(user_args[i + 1])
+\t\t\t\t\ti += 2
+\t\t\t\telse:
+\t\t\t\t\ti += 1
+\t\t\t_:
+\t\t\t\ti += 1
+
+\tif output_path.is_empty():
+\t\tpush_error("[mcp_capture] missing --output")
+\t\tget_tree().quit(1)
+\t\treturn
+
+\tif target_path.is_empty():
+\t\ttarget_path = ProjectSettings.get_setting("application/run/main_scene", "")
+
+\tif target_path.is_empty():
+\t\tpush_error("[mcp_capture] no target scene (provide --target or set main_scene)")
+\t\tget_tree().quit(1)
+\t\treturn
+
+\tvar packed: PackedScene = load(target_path)
+\tif packed == null:
+\t\tpush_error("[mcp_capture] failed to load: %s" % target_path)
+\t\tget_tree().quit(1)
+\t\treturn
+
+\tvar inst: Node = packed.instantiate()
+\tadd_child(inst)
+
+\t# Let the scene render. Many real scenes use awaits inside _ready that
+\t# resolve on later frames; a small wall-clock delay is more robust than
+\t# a fixed frame count.
+\tawait get_tree().create_timer(delay_seconds).timeout
+
+\tvar img: Image = get_viewport().get_texture().get_image()
+\tvar err: int = img.save_png(output_path)
+\tif err != OK:
+\t\tpush_error("[mcp_capture] save_png failed: %s" % err)
+\t\tget_tree().quit(1)
+\t\treturn
+
+\tprint("[mcp_capture] saved %s" % output_path)
+\tget_tree().quit(0)
+`;
+
+/**
+ * TSCN content for the viewport capture wrapper scene. References capture.gd
+ * by res:// path. Written next to the script when the tool runs.
+ */
+const CAPTURE_SCENE_TSCN: string = `[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://.mcp_capture/capture.gd" id="1_capture"]
+
+[node name="MCPCapture" type="Node"]
+script = ExtResource("1_capture")
+`;
 
 /**
  * Main server class for the Godot MCP server
@@ -923,6 +1013,32 @@ class GodotServer {
             required: ['projectPath'],
           },
         },
+        {
+          name: 'capture_viewport',
+          description: 'Render a Godot scene briefly and capture the viewport as a PNG. Returns the image inline so the caller can see the rendered output. Uses the project main_scene if no scene path is provided.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Optional: res:// path to a specific scene. Defaults to the project main_scene.',
+              },
+              delaySeconds: {
+                type: 'number',
+                description: 'Optional: seconds to wait after instancing the scene before capture (default 0.5). Increase for scenes with multi-frame await chains in _ready.',
+              },
+              outputPath: {
+                type: 'string',
+                description: 'Optional: absolute path to save the PNG. Defaults to a path under the OS temp directory.',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
       ],
     }));
 
@@ -958,6 +1074,8 @@ class GodotServer {
           return await this.handleGetUid(request.params.arguments);
         case 'update_project_uids':
           return await this.handleUpdateProjectUids(request.params.arguments);
+        case 'capture_viewport':
+          return await this.handleCaptureViewport(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -2166,6 +2284,164 @@ class GodotServer {
         ]
       );
     }
+  }
+
+  /**
+   * Handle the capture_viewport tool.
+   *
+   * Renders a scene briefly with a real (non-headless) Godot instance and
+   * returns the viewport PNG as inline image content. Writes a small wrapper
+   * scene into <project>/.mcp_capture/ so the project's main_scene is never
+   * modified. The capture script is bundled as a string constant above; we
+   * write it to disk on each invocation (overwriting any prior copy) so
+   * upgrades take effect without manual cleanup.
+   */
+  private async handleCaptureViewport(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (!args.projectPath) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    const projectFile = join(args.projectPath, 'project.godot');
+    if (!existsSync(projectFile)) {
+      return this.createErrorResponse(
+        `Not a valid Godot project: ${args.projectPath}`,
+        [
+          'Ensure the path points to a directory containing a project.godot file',
+          'Use list_projects to find valid Godot projects',
+        ]
+      );
+    }
+
+    if (!this.godotPath) {
+      await this.detectGodotPath();
+      if (!this.godotPath) {
+        return this.createErrorResponse(
+          'Could not find a valid Godot executable path',
+          [
+            'Ensure Godot is installed correctly',
+            'Set GODOT_PATH environment variable to specify the correct path',
+          ]
+        );
+      }
+    }
+
+    // Stop any active project so we don't fight over the window / debug socket.
+    if (this.activeProcess) {
+      this.logDebug('Stopping active Godot process before capture');
+      try { this.activeProcess.process.kill(); } catch {}
+      this.activeProcess = null;
+    }
+
+    // Materialize wrapper script + scene under .mcp_capture/.
+    const captureDir = join(args.projectPath, '.mcp_capture');
+    try {
+      if (!existsSync(captureDir)) {
+        mkdirSync(captureDir, { recursive: true });
+      }
+      writeFileSync(join(captureDir, 'capture.gd'), CAPTURE_SCRIPT_GD, 'utf8');
+      writeFileSync(join(captureDir, 'capture.tscn'), CAPTURE_SCENE_TSCN, 'utf8');
+      // Make sure casual git checkouts don't pick this up.
+      writeFileSync(join(captureDir, '.gitignore'), '*\n', 'utf8');
+    } catch (err: any) {
+      return this.createErrorResponse(
+        `Failed to write capture scaffolding: ${err?.message || 'unknown error'}`,
+        ['Check write permissions on the project directory']
+      );
+    }
+
+    // Pick output path. Default to OS temp so we don't pollute the project.
+    const outputPath: string = args.outputPath
+      ? args.outputPath
+      : join(tmpdir(), `mcp_capture_${Date.now()}.png`);
+    const delaySeconds: number =
+      typeof args.delaySeconds === 'number' && args.delaySeconds >= 0
+        ? args.delaySeconds
+        : 0.5;
+
+    // Compose the launch args. The user-args (after `--`) are read by capture.gd
+    // via OS.get_cmdline_user_args().
+    const cmdArgs: string[] = [
+      '--path', args.projectPath,
+      'res://.mcp_capture/capture.tscn',
+      '--',
+      '--output', outputPath,
+      '--delay', String(delaySeconds),
+    ];
+    if (args.scenePath) {
+      if (!this.validatePath(args.scenePath)) {
+        return this.createErrorResponse(
+          'Invalid scene path',
+          ['Provide a res:// path inside the project, without ".." segments']
+        );
+      }
+      cmdArgs.push('--target', args.scenePath);
+    }
+
+    this.logDebug(`Spawning Godot for capture: ${this.godotPath} ${cmdArgs.join(' ')}`);
+
+    // Run Godot to completion. capture.gd calls quit() once the PNG is saved.
+    const exitInfo = await new Promise<{ code: number | null; stderr: string; stdout: string }>((resolve) => {
+      const proc = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe' });
+      let stdout = '';
+      let stderr = '';
+      proc.stdout?.on('data', (d: Buffer) => { stdout += d.toString(); });
+      proc.stderr?.on('data', (d: Buffer) => { stderr += d.toString(); });
+      // Hard timeout: capture should normally finish in 1-3s.
+      const timeoutMs = Math.max(5000, Math.ceil(delaySeconds * 1000) + 8000);
+      const killer = setTimeout(() => {
+        try { proc.kill(); } catch {}
+      }, timeoutMs);
+      proc.on('exit', (code) => {
+        clearTimeout(killer);
+        resolve({ code, stdout, stderr });
+      });
+      proc.on('error', () => {
+        clearTimeout(killer);
+        resolve({ code: -1, stdout, stderr });
+      });
+    });
+
+    if (!existsSync(outputPath)) {
+      return this.createErrorResponse(
+        `Capture finished but no PNG was written at ${outputPath}`,
+        [
+          'Check that the target scene loads without erroring',
+          'Increase delaySeconds if the scene needs longer to render',
+          `Godot stderr (truncated): ${exitInfo.stderr.slice(-800)}`,
+        ]
+      );
+    }
+
+    // Read the PNG and return inline so the caller sees the image without a
+    // second tool round-trip. Path is also included so it can be re-read later.
+    const pngBuffer = readFileSync(outputPath);
+    const base64 = pngBuffer.toString('base64');
+
+    return {
+      content: [
+        {
+          type: 'image',
+          data: base64,
+          mimeType: 'image/png',
+        },
+        {
+          type: 'text',
+          text: `Captured ${pngBuffer.byteLength} bytes to ${outputPath}\nProcess exit code: ${exitInfo.code}`,
+        },
+      ],
+    };
   }
 
   /**
